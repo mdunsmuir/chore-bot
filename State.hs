@@ -45,6 +45,8 @@ module State
 , RemoveChore (..)
 , UpdateState (..)
 
+, updateToday
+
 , module Data.Acid
 ) where
 
@@ -53,14 +55,19 @@ import Data.Typeable
 import Data.List (cycle, find)
 import qualified Data.Text as T
 import qualified Data.Set as S
+import Data.Time (getCurrentTime, getCurrentTimeZone, LocalTime (..), utcToLocalTime)
 import Data.Time.Calendar (Day, fromGregorian)
 import Data.Time.Calendar.WeekDate (toWeekDate)
+import Data.Time.Format
 import Data.SafeCopy (base, deriveSafeCopy)
 import Control.Monad.State.Class (get, put, modify)
 import Control.Monad.Reader.Class (ask)
 import Data.Acid
 import Control.Lens (set, over)
 import Control.Lens.TH
+import Data.Aeson (ToJSON (..))
+import qualified Data.Aeson as A
+import Data.Aeson.TH
 
 data Person = Person
             { _personName :: T.Text
@@ -68,12 +75,14 @@ data Person = Person
 
 makeLenses ''Person
 $(deriveSafeCopy 0 'base ''Person)
+$(deriveJSON defaultOptions { fieldLabelModifier = tail } ''Person)
 
-data Duty = Only Person
-          | Alternating [Person]
+data Duty = Only { _dutyPerson :: Person }
+          | Alternating { _dutyPeople :: [Person] }
             deriving (Eq, Ord, Show)
 
 $(deriveSafeCopy 0 'base ''Duty)
+$(deriveJSON defaultOptions { fieldLabelModifier = tail } ''Duty)
 
 nextPerson :: Duty -> Person -> Person
 nextPerson (Only p) _ = p
@@ -95,12 +104,14 @@ data WeekDay = Monday
                deriving (Eq, Ord, Enum, Show)
 
 $(deriveSafeCopy 0 'base ''WeekDay)
+$(deriveJSON defaultOptions { fieldLabelModifier = tail } ''WeekDay)
 
-data Recurrence = EveryWeekDay WeekDay
-                | EveryNDays Int
+data Recurrence = EveryWeekDay { _recurrenceWeekday :: WeekDay }
+                | EveryNDays { _recurrenceNDays :: Int }
                   deriving (Eq, Ord, Show)
 
 $(deriveSafeCopy 0 'base ''Recurrence)
+$(deriveJSON defaultOptions { fieldLabelModifier = tail } ''Recurrence)
 
 recurrenceHit :: Recurrence -> Day -> Day -> Bool
 recurrenceHit (EveryWeekDay wd) d1 d2 =
@@ -125,6 +136,7 @@ data Chore = Chore
 
 makeLenses ''Chore
 $(deriveSafeCopy 0 'base ''Chore)
+$(deriveJSON defaultOptions { fieldLabelModifier = tail } ''Chore)
 
 data Instance = Instance
               { _instanceChore :: Chore
@@ -134,10 +146,23 @@ data Instance = Instance
 
 makeLenses ''Instance
 $(deriveSafeCopy 0 'base ''Instance)
+$(deriveJSON defaultOptions { fieldLabelModifier = tail } ''Instance)
+
+data CalendarItem = CalendarItem
+                  { _calendarItemDay :: Day
+                  , _calendarItemInstance :: Instance
+                  } deriving (Eq, Show)
+
+$(deriveSafeCopy 0 'base ''CalendarItem)
+$(deriveJSON defaultOptions { fieldLabelModifier = tail } ''CalendarItem)
+
+instance Ord CalendarItem where
+  (CalendarItem d1 i1) `compare` (CalendarItem d2 i2) =
+    (d1, i1) `compare` (d2, i2)
 
 data State = State
            { _stateChores :: S.Set Chore
-           , _stateCalendar :: S.Set (Day, Instance)
+           , _stateCalendar :: S.Set CalendarItem
            , _stateLastUpdate :: Day
            } deriving (Eq, Ord, Show, Typeable)
 
@@ -150,7 +175,7 @@ $(deriveSafeCopy 0 'base ''State)
 getChores :: Query State (S.Set Chore)
 getChores = _stateChores <$> ask
 
-getCalendar :: Query State (S.Set (Day, Instance))
+getCalendar :: Query State (S.Set CalendarItem)
 getCalendar = _stateCalendar <$> ask
 
 addChore :: Chore -> Update State ()
@@ -174,24 +199,32 @@ updateDay day = do
   State chores calendar _ <- get
   let calDesc = S.toDescList calendar
   forM_ chores $ \chore@(Chore _ rec _) -> do
-    let maybeFound = find ((chore ==) . _instanceChore . snd) calDesc
+    let maybeFound = find ((chore ==) . _instanceChore . _calendarItemInstance) calDesc
     case maybeFound of
       Nothing -> makeFirst day chore
-      Just (prevDay, prevInstance) -> 
+      Just (CalendarItem prevDay prevInstance) -> 
         when (recurrenceHit rec prevDay day) $ makeChore day prevInstance
 
 makeChore :: Day -> Instance -> Update State ()
 makeChore day (Instance chore prevOwner _) =
   let nextOwner = nextPerson (_choreDuty chore) prevOwner
       nextInstance = Instance chore nextOwner Nothing
-      tup = (day, nextInstance)
+      tup = CalendarItem day nextInstance
   in  modify $ over stateCalendar $ S.insert tup
   
 makeFirst :: Day -> Chore -> Update State ()
 makeFirst day chore@(Chore _ rec duty) = 
   let firstInstance = Instance chore (firstOwner duty) Nothing
-      tup = (day, firstInstance)
+      tup = CalendarItem day firstInstance
   in  when (isAllowableFirstDay rec day) $
         modify $ over stateCalendar $ S.insert tup
 
 $(makeAcidic ''State ['getChores, 'getCalendar, 'addChore, 'removeChore, 'updateState])
+
+updateToday :: AcidState State -> IO ()
+updateToday acid = do
+  t0 <- getCurrentTime
+  tz <- getCurrentTimeZone
+  let (LocalTime d0 _) = utcToLocalTime tz t0
+  update acid (UpdateState d0)
+

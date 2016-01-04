@@ -18,25 +18,27 @@
 
 {-# LANGUAGE OverloadedStrings #-}
 
-import Data.Time
+module API where
+
+import Control.Monad.IO.Class
+import Data.Aeson hiding (json)
+import Data.String.Conversions
+import Web.Scotty
 import State
-import API
 
-main = do
-  acid <- openLocalState defaultState
-  server acid
+server :: AcidState State -> IO ()
+server acid = scotty 3000 $ do
 
--- below here cheesy stuff for setting up
+  get "/chores" $ do
+    chores <- liftIO $ query acid GetChores 
+    json chores
 
-michael :: Person
-michael = Person "Michael"
+  get "/calendar" $ do
+    liftIO $ updateToday acid
+    calendar <- liftIO $ query acid GetCalendar
 
-emily :: Person
-emily = Person "Emily"
-
-dishes :: AcidState State -> IO ()
-dishes acid = do  
-  let duty = Alternating [michael, emily]
-      rec = EveryNDays 1
-      chore = Chore "Dishes" rec duty
-  update acid (AddChore chore)
+    -- unfortunately for some reason Scotty was eating the quotation
+    -- marks around my dates so I had to do this rather than use the
+    -- handy 'json' action.
+    setHeader "Content-Type" "application/json; charset=utf-8"
+    raw $ encode $ toJSON calendar
