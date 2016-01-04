@@ -24,10 +24,13 @@ import Control.Monad.IO.Class
 import Data.Aeson hiding (json)
 import Data.String.Conversions
 import Web.Scotty
+import Network.Wai.Middleware.RequestLogger
 import State
 
 server :: AcidState State -> IO ()
 server acid = scotty 3000 $ do
+
+  middleware logStdoutDev
 
   get "/chores" $ do
     chores <- liftIO $ query acid GetChores 
