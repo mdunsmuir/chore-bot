@@ -21,9 +21,11 @@
 module API where
 
 import Control.Monad.IO.Class
+import qualified Data.Text as T
 import Data.Aeson hiding (json)
 import Data.String.Conversions
 import Web.Scotty
+import Network.HTTP.Types.Status
 import Network.Wai.Middleware.RequestLogger
 import State
 
@@ -36,9 +38,27 @@ server acid = scotty 3000 $ do
     chores <- liftIO $ query acid GetChores 
     json chores
 
+  get "/chores/:id" $ do
+    id <- param "id"
+    maybeChore <- liftIO $ query acid $ GetChore id
+    case maybeChore of
+      Just chore -> json chore
+      Nothing -> do
+        status status404
+        json ("chore not found" :: T.Text)
+
   get "/instances" $ do
     instances <- liftIO $ query acid GetInstances
     json instances
+
+  get "/instances/:id" $ do
+    id <- param "id"
+    maybeInstance <- liftIO $ query acid $ GetInstance id
+    case maybeInstance of
+      Just inst -> json inst
+      Nothing -> do
+        status status404
+        json ("instance not found" :: T.Text)
 
   get "/calendar" $ do
     liftIO $ updateToday acid
@@ -49,3 +69,5 @@ server acid = scotty 3000 $ do
     -- handy 'json' action.
     setHeader "Content-Type" "application/json; charset=utf-8"
     raw $ encode $ toJSON calendar
+
+

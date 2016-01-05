@@ -327,6 +327,8 @@ makeChore day prevInstance = do
   addInstance day nextInstance
   return ()
 
+-- finally, deriving the acid-state stuff for all the above functions
+
 $(makeAcidic ''State ['getChores, 'getInstances, 'getCalendar, 'getChore, 'getInstance, 'getNextChoreId, 'getNextInstanceId, 'addChore, 'addInstance, 'deleteInstance, 'deleteChore, 'updateState])
 
 updateToday :: AcidState State -> IO ()
