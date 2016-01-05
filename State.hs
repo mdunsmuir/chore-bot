@@ -16,10 +16,13 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 -}
 
-{-# LANGUAGE TemplateHaskell, DeriveDataTypeable, TypeFamilies #-}
+{-# LANGUAGE TupleSections, RankNTypes, TemplateHaskell, DeriveDataTypeable, TypeFamilies #-}
 
 module State
-( Person (..)
+( Id
+
+, Person (..)
+
 , personName
 
 , Duty (..)
@@ -32,29 +35,41 @@ module State
 , choreName, choreRecurrence
 
 , Instance (..)
-, instanceChore
+, instanceChoreId
 , instanceCompleted
 
 , State (..)
-, stateChores, stateCalendar
+, stateChores, stateInstances, stateCalendar
 , defaultState
 
 , GetChores (..)
+, GetInstances (..)
 , GetCalendar (..)
-, AddChore (..)
-, RemoveChore (..)
-, UpdateState (..)
+, GetChore (..)
+, GetInstance (..)
 
+, GetNextChoreId (..)
+, GetNextInstanceId (..)
+
+, AddChore (..)
+, AddInstance (..)
+
+, DeleteInstance (..)
+, DeleteChore (..)
+
+, UpdateState
 , updateToday
 
 , module Data.Acid
 ) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, forM, when)
 import Data.Typeable
 import Data.List (cycle, find)
+import Data.Maybe (fromJust)
 import qualified Data.Text as T
 import qualified Data.Set as S
+import qualified Data.IntMap.Strict as IM
 import Data.Time (getCurrentTime, getCurrentTimeZone, LocalTime (..), utcToLocalTime)
 import Data.Time.Calendar (Day, fromGregorian)
 import Data.Time.Calendar.WeekDate (toWeekDate)
@@ -63,11 +78,13 @@ import Data.SafeCopy (base, deriveSafeCopy)
 import Control.Monad.State.Class (get, put, modify)
 import Control.Monad.Reader.Class (ask)
 import Data.Acid
-import Control.Lens (set, over)
+import Control.Lens (view, set, over, Lens')
 import Control.Lens.TH
 import Data.Aeson (ToJSON (..))
 import qualified Data.Aeson as A
 import Data.Aeson.TH
+
+type Id = Int
 
 data Person = Person
             { _personName :: T.Text
@@ -139,7 +156,7 @@ $(deriveSafeCopy 0 'base ''Chore)
 $(deriveJSON defaultOptions { fieldLabelModifier = tail } ''Chore)
 
 data Instance = Instance
-              { _instanceChore :: Chore
+              { _instanceChoreId :: Id
               , _instanceOwner :: Person
               , _instanceCompleted :: Maybe Day
               } deriving (Eq, Ord, Show)
@@ -150,7 +167,7 @@ $(deriveJSON defaultOptions { fieldLabelModifier = tail } ''Instance)
 
 data CalendarItem = CalendarItem
                   { _calendarItemDay :: Day
-                  , _calendarItemInstance :: Instance
+                  , _calendarItemInstanceId :: Id
                   } deriving (Eq, Show)
 
 $(deriveSafeCopy 0 'base ''CalendarItem)
@@ -161,32 +178,116 @@ instance Ord CalendarItem where
     (d1, i1) `compare` (d2, i2)
 
 data State = State
-           { _stateChores :: S.Set Chore
+           { _stateChores :: IM.IntMap Chore
+           , _stateInstances :: IM.IntMap Instance
            , _stateCalendar :: S.Set CalendarItem
            , _stateLastUpdate :: Day
            } deriving (Eq, Ord, Show, Typeable)
 
 defaultState :: State
-defaultState = State S.empty S.empty $ fromGregorian 2015 12 1
+defaultState = State IM.empty IM.empty S.empty $ fromGregorian 2015 12 1
 
 makeLenses ''State
 $(deriveSafeCopy 0 'base ''State)
 
-getChores :: Query State (S.Set Chore)
+-- basic queries
+
+getChores :: Query State (IM.IntMap Chore)
 getChores = _stateChores <$> ask
+
+getInstances :: Query State (IM.IntMap Instance)
+getInstances = _stateInstances <$> ask
 
 getCalendar :: Query State (S.Set CalendarItem)
 getCalendar = _stateCalendar <$> ask
 
-addChore :: Chore -> Update State ()
-addChore = modify . over stateChores . S.insert
+getMap :: Lens' State (IM.IntMap a) -> Id -> Query State (Maybe a)
+getMap lens id = IM.lookup id . view lens <$> ask
 
-removeChore :: Chore -> Update State ()
-removeChore = modify . over stateChores . S.delete
+getChore :: Id -> Query State (Maybe Chore)
+getChore = getMap stateChores
+
+getInstance :: Id -> Query State (Maybe Instance)
+getInstance = getMap stateInstances
+
+-- getting IDs
+
+getNextId :: (State -> IM.IntMap a) -> Query State Id
+getNextId getter = do
+  choreMap <- getter <$> ask
+  return $ if IM.null choreMap
+    then 1
+    else succ $ fst $ IM.findMax choreMap
+
+getNextChoreId :: Query State Id
+getNextChoreId = getNextId _stateChores
+
+getNextInstanceId :: Query State Id
+getNextInstanceId = getNextId _stateInstances
+
+-- adding chores and instances
+
+addMap :: Lens' State (IM.IntMap a)
+       -> Query State Id
+       -> a
+       -> Update State Id
+addMap lens getId value = do
+  nextId <- liftQuery getId
+  modify $ over lens $ IM.insert nextId value
+  return nextId
+
+addChore :: Chore -> Update State Id
+addChore = addMap stateChores getNextChoreId
+
+addInstance :: Day -> Instance -> Update State Id
+addInstance day inst = do
+  id <- addMap stateInstances getNextInstanceId inst
+  modify $ over stateCalendar $ S.insert $ CalendarItem day id
+  return id
+
+-- removing chores and instances
+
+removeMap :: Lens' State (IM.IntMap a)
+          -> Id
+          -> Update State (Maybe a)
+removeMap lens id = do
+  exists <- (IM.member id . view lens) <$> get
+  case exists of
+    False -> return Nothing
+    True -> do
+      value <- (IM.lookup id . view lens) <$> get
+      modify $ over lens (IM.delete id)
+      return value
+
+deleteInstance :: Id -> Update State (Maybe Instance)
+deleteInstance id = do
+  let pred = (id /=) . _calendarItemInstanceId
+  modify $ over stateCalendar $ S.filter pred
+  removeMap stateInstances id
+
+deleteChore :: Id -> Update State (Maybe (Chore, [Instance]))
+deleteChore id = do
+  maybeValue <- removeMap stateChores id
+  case maybeValue of
+    Nothing -> return Nothing
+    Just value -> do
+      instances <- deleteInstancesWithChoreId id
+      return $ Just (value, instances)
+
+deleteInstancesWithChoreId :: Id -> Update State [Instance]
+deleteInstancesWithChoreId id = do
+  toDelete <- IM.filter pred . _stateInstances <$> get
+  forM (IM.toList toDelete) $ \(id, inst) -> do
+    deleteInstance id
+    return inst
+  where
+    pred = (id ==) . _instanceChoreId
+
+-- updating the state (populating the calendar and so on)
 
 updateState :: Day -> Update State ()
 updateState day = do
-  State _ _ lastUpdate <- get
+  State _ _ _ lastUpdate <- get
   if day == lastUpdate
     then return ()
     else do forM_ (tail [lastUpdate..day]) updateDay
@@ -196,30 +297,37 @@ updateState day = do
 
 updateDay :: Day -> Update State ()
 updateDay day = do
-  State chores calendar _ <- get
-  let calDesc = S.toDescList calendar
-  forM_ chores $ \chore@(Chore _ rec _) -> do
-    let maybeFound = find ((chore ==) . _instanceChore . _calendarItemInstance) calDesc
+  cal <- liftQuery getCalendar
+  calDesc <- forM (S.toDescList cal) $ \(CalendarItem day id) ->
+    (day,) . fromJust <$> liftQuery (getInstance id)
+
+  chores <- liftQuery getChores
+  forM_ (IM.toList chores) $ \(id, chore) -> do
+    let maybeFound = find ((id ==) . _instanceChoreId . snd) calDesc
+        Chore _ rec _ = chore
+
     case maybeFound of
-      Nothing -> makeFirst day chore
-      Just (CalendarItem prevDay prevInstance) -> 
+      Nothing -> makeFirst day id
+      Just (prevDay, prevInstance) -> 
         when (recurrenceHit rec prevDay day) $ makeChore day prevInstance
 
-makeChore :: Day -> Instance -> Update State ()
-makeChore day (Instance chore prevOwner _) =
-  let nextOwner = nextPerson (_choreDuty chore) prevOwner
-      nextInstance = Instance chore nextOwner Nothing
-      tup = CalendarItem day nextInstance
-  in  modify $ over stateCalendar $ S.insert tup
-  
-makeFirst :: Day -> Chore -> Update State ()
-makeFirst day chore@(Chore _ rec duty) = 
-  let firstInstance = Instance chore (firstOwner duty) Nothing
-      tup = CalendarItem day firstInstance
-  in  when (isAllowableFirstDay rec day) $
-        modify $ over stateCalendar $ S.insert tup
+makeFirst :: Day -> Id -> Update State ()
+makeFirst day id = do
+  Chore _ rec duty <- fromJust <$> liftQuery (getChore id)
+  let firstInstance = Instance id (firstOwner duty) Nothing
+  when (isAllowableFirstDay rec day) $
+    addInstance day firstInstance >> return ()
 
-$(makeAcidic ''State ['getChores, 'getCalendar, 'addChore, 'removeChore, 'updateState])
+makeChore :: Day -> Instance -> Update State ()
+makeChore day prevInstance = do
+  let Instance id prevOwner _ = prevInstance
+  Chore _ rec duty <- fromJust <$> liftQuery (getChore id)
+  let nextOwner = nextPerson duty prevOwner
+      nextInstance = Instance id nextOwner Nothing
+  addInstance day nextInstance
+  return ()
+
+$(makeAcidic ''State ['getChores, 'getInstances, 'getCalendar, 'getChore, 'getInstance, 'getNextChoreId, 'getNextInstanceId, 'addChore, 'addInstance, 'deleteInstance, 'deleteChore, 'updateState])
 
 updateToday :: AcidState State -> IO ()
 updateToday acid = do
@@ -227,4 +335,3 @@ updateToday acid = do
   tz <- getCurrentTimeZone
   let (LocalTime d0 _) = utcToLocalTime tz t0
   update acid (UpdateState d0)
-

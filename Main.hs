@@ -18,12 +18,21 @@
 
 {-# LANGUAGE OverloadedStrings #-}
 
+import Control.Monad (forM_)
 import Data.Time
+import qualified Data.IntMap.Strict as IM
 import State
 import API
 
 main = do
   acid <- openLocalState defaultState
+  --dishes acid
+
+  --chores <- query acid GetChores
+  --forM_ (map snd $ IM.toList chores) (putStrLn . show)
+
+  --chore <- query acid $ GetChore 1
+  --putStrLn $ show chore
   server acid
 
 -- below here cheesy stuff for setting up
@@ -34,7 +43,7 @@ michael = Person "Michael"
 emily :: Person
 emily = Person "Emily"
 
-dishes :: AcidState State -> IO ()
+dishes :: AcidState State -> IO Id
 dishes acid = do  
   let duty = Alternating [michael, emily]
       rec = EveryNDays 1

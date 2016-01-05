@@ -36,6 +36,10 @@ server acid = scotty 3000 $ do
     chores <- liftIO $ query acid GetChores 
     json chores
 
+  get "/instances" $ do
+    instances <- liftIO $ query acid GetInstances
+    json instances
+
   get "/calendar" $ do
     liftIO $ updateToday acid
     calendar <- liftIO $ query acid GetCalendar
